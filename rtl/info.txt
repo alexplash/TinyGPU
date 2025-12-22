@@ -1,0 +1,283 @@
+
+rtl/ (Real hardware modules)
+These are the modules you’re supposed to deliver: they describe hardware that would exist on a chip. Verilator “compiles” them into C++ to simulate.
+
+rtl/params.svh
+This is a header file (like a shared constants file).
+It defines parameter defaults like DATA_WIDTH=8, MAT_DIM=4, etc.
+It defines opcodes like OP_RUN, OP_SET_W_BASE, etc.
+Every module includes it so they agree on widths and constants.
+Why important: the spec says “don’t hardcode,” so everyone should use shared parameters.
+
+rtl/skid_buffer.sv
+This is a small, reusable module that solves a common streaming problem:
+upstream can present data (in_vld)
+downstream can refuse (out_rdy=0)
+you must not drop data
+So skid_buffer acts like a one-slot “catcher’s mitt”:
+if downstream can’t take it, it stores one beat
+later, when downstream is ready, it releases it
+Right now: it exists, compiles, but nothing is using it yet (because fetch_engine is still a stub).
+
+rtl/fetch_engine.sv
+This will eventually:
+accept commands (start, op_code, cfg_data)
+generate memory read requests (m_req_vld, m_req_addr)
+accept memory responses (m_rsp_vld, m_rsp_data)
+stream bytes out to the core (src_vld, src_data) using valid/ready
+raise busy while it’s running
+Right now: it outputs all zeros / idle forever.
+So no memory requests, no outgoing bytes.
+
+rtl/matrix_core.sv
+This will eventually:
+take a stream of 20 bytes:
+first 16 bytes = W matrix
+next 4 bytes = X vector
+compute Y = W·X
+output 4 accumulated results as a stream
+Right now: it outputs “not ready, no valid” forever.
+
+
+rtl/gpu_top.sv
+This is the “glue module.” It wires:
+fetch_engine output stream → matrix_core input stream
+matrix_core output stream → top-level output pins
+So conceptually:
+Memory ↔ fetch_engine  ---> (stream of bytes) ---> matrix_core ---> results out
+
+
+
+
+---- HIGH LEVEL BREAKDOWN ----
+
+The three “actors” in this assignment:
+
+1) Host / CPU (in real life)
+This is whoever tells the GPU what to do.
+In your design, the host controls the GPU through:
+start
+op_code
+cfg_data
+Think: “write registers + press go”.
+
+2) System Memory (RAM)
+This is where the input data lives:
+W matrix (16 bytes)
+X vector (4 bytes)
+The only interface you have to memory is:
+request channel: m_req_vld, m_req_rdy, m_req_addr
+response channel: m_rsp_vld, m_rsp_data
+Important: memory is “dumb” in your design. You don’t get to read memory directly — you must request and wait for responses.
+
+3) The GPU logic
+
+Split into two blocks:
+
+A) fetch_engine:
+
+Its job is basically DMA (data mover):
+it takes “run” commands and base addresses
+it generates a stream of memory read requests
+it receives returned bytes
+it emits those bytes as a clean valid/ready stream toward the compute block
+So fetch_engine is the bridge between “RAM-style req/rsp” and “stream-style byte flow”.
+
+B) matrix_core:
+
+Its job is compute:
+it consumes a stream of 20 bytes:
+first 16 are W (4×4)
+next 4 are X (4×1)
+it computes Y = W·X
+it produces a stream of 4 results (accumulator width)
+So matrix_core is a stream consumer + stream producer.
+
+Why does fetch_engine “stream bytes” to matrix_core?
+Because matrix_core doesn’t care about addresses or memory timing.
+Matrix_core just wants the bytes in order:
+W[0], W[1], ..., W[15], X[0], X[1], X[2], X[3]
+
+Fetch_engine deals with:
+whether RAM is ready for requests (m_req_rdy)
+when RAM returns bytes (m_rsp_vld)
+buffering issues (skid buffer) when matrix_core can’t accept data yet
+
+
+What “stream of bytes” means (valid/ready)
+Between fetch_engine and matrix_core you have:
+src_vld (from fetch_engine) → “I am presenting a valid byte now”
+src_data (from fetch_engine) → “here is the byte”
+snk_rdy (from matrix_core) → “I am ready to accept a byte now”
+A byte is actually transferred only on a clock edge where:
+src_vld && snk_rdy is true.
+That single rule is the whole game.
+
+A concrete “timeline” of what happens in a run
+Here’s the flow after the host sets addresses and runs:
+
+Step 1: Host config
+Host sends OP_SET_W_BASE with cfg_data = W_BASE
+Host sends OP_SET_X_BASE with cfg_data = X_BASE
+Host sends OP_RUN
+Fetch_engine stores W_BASE / X_BASE and starts working.
+
+Step 2: Fetch_engine reads memory (W then X)
+Fetch_engine starts issuing requests:
+Request phase
+For i=0..15:
+drive m_req_vld=1, m_req_addr=W_BASE + i
+if m_req_rdy=1, that request is accepted and it increments i
+if m_req_rdy=0, it holds the same address and waits
+Then for i=0..3:
+same thing but using X_BASE + i
+Response phase
+Memory returns bytes later, using:
+m_rsp_vld=1, m_rsp_data=<byte>
+Fetch_engine must forward those returned bytes into the stream toward matrix_core.
+
+Step 3: matrix_core consumes exactly 20 bytes
+Matrix_core internally has a state machine:
+LOAD_W: accept 16 bytes (W)
+LOAD_X: accept 4 bytes (X)
+COMPUTE: compute Y in 1 cycle
+FLUSH: stream out 4 results
+While it’s in LOAD_W / LOAD_X it asserts snk_rdy=1 (ready to accept).
+While it’s computing or flushing outputs, it deasserts snk_rdy=0 (not accepting).
+
+Step 4: results flow out
+Now matrix_core produces results:
+result_vld goes high when output is valid
+result_data holds the output
+result is taken only when result_vld && result_rdy
+That’s how the host (or TB) receives the 4 outputs.
+
+Why do we need the skid buffer?
+Because memory responses can arrive when matrix_core isn’t ready.
+Example:
+matrix_core is in COMPUTE or FLUSH → snk_rdy=0
+but RAM returns m_rsp_vld=1 with a byte at that exact time
+without buffering, that byte would be dropped
+So fetch_engine uses the skid buffer to “catch” one returned byte when the downstream consumer (matrix_core) says “not ready”.
+
+
+
+
+
+
+---- Terminology ----
+clk: Clock. Hardware updates on clock edges (usually rising edge). hardware sends electrical impulses at this rate, based on the "clock"
+Think: “the heartbeat.”
+
+rst_n: Reset, active-low (_n means “negative / active low”). when rst_n = 0, the reset is ON (the circuit is being forced into its starting state). when rst_n = 1, the reset is OFF (normal operation)
+rst_n = 0 resets the circuit. rst_n = 1 lets it run.
+
+vld / valid
+Means: “I (the sender) am presenting a real value right now.”
+
+rdy / ready
+Means: “I (the receiver) am able to accept a value right now.”
+
+The only time data actually transfers
+A transfer happens on a clock edge when:
+valid && ready
+That’s it. That’s the whole handshake rule.
+
+src
+Source = the sender of a stream.
+
+snk
+Sink = the receiver of a stream.
+
+So between fetch_engine and matrix_core:
+fetch_engine is the src
+matrix_core is the snk
+
+*_data
+The actual payload bits being transferred (byte, word, etc.)
+
+*_addr
+An address (for memory requests)
+
+*_req_*
+Request channel (asking memory for data)
+
+*_rsp_*
+Response channel (memory returning the data)
+
+
+
+What each name means in your project
+
+Memory interface
+m_req_vld = “GPU is issuing a memory read request now”
+m_req_rdy = “Memory is ready to accept a request now”
+m_req_addr = “Address being requested”
+m_rsp_vld = “Memory is returning a response byte now”
+m_rsp_data = “The returned byte”
+
+Stream from fetch_engine → matrix_core
+src_vld = “fetch_engine is offering a byte”
+src_data = “that byte”
+src_rdy = “matrix_core is ready to take a byte” (even though it’s named src_rdy, it’s driven by the receiver)
+
+In gpu_top we wire:
+fe.src_vld -> core.snk_vld
+core.snk_rdy -> fe.src_rdy
+So src_rdy is really “downstream ready”.
+
+Results stream out of matrix_core
+result_vld = “matrix_core has a valid output result”
+result_rdy = “the outside world is ready to accept it”
+result_data = “the output number”
+
+Control / status
+start = “host is launching a command”
+op_code = which command (set base, run, etc.)
+cfg_data = value associated with command (like base address)
+busy = “fetch_engine is currently running a RUN command”
+
+
+Input/output
+input: means this signal comes into the module (driven by something outside)
+output: means this signal is driven by the module and goes outward
+
+logic: logic is a systemverilog data type. it is basically just a normal digital signal
+
+
+bits
+2'b01: bit object of width 2 (2 bits), that looks like tis => [0, 1]
+2'b11: bit object of width 2 (2 bits), that looks like tis => [1, 1]
+'0: bit object of whatever the input width is, filled with all zero bits
+input logic [DATA_WIDTH-1:0] snk_data: snk_data is initialized as an 8-bit bus, bits 7 down to 0, so total length of 8, because DATA_WIDTH is 8
+
+
+assign/=/<=
+1) assign: It’s like putting up a sign that says: "If the light is ON, the door is OPEN. If the light is OFF, the door is CLOSED.”
+basically it doesn't wait to be run each time in the code loop; it is like a live connection that always updates the value with what the expression currently evaluates to
+2) =: do it right now, step-by-step. 
+This is like a cashier following instructions in order:
+Step 1: write down the order
+Step 2: now use what you wrote to calculate the total
+Each line happens immediately, and the next line sees the updated result.
+So a = b; c = a + 1; means:
+c uses the new value of a (because a changed immediately).
+3) <=: schedule it for the end of the clock tick.
+So in hardware terms:
+At the clock edge, you decide what the new values should be
+Then all registers update simultaneously
+That’s why in flip-flop logic you want <=.
+Example:
+q <= d;
+r <= q;
+Means:
+q becomes d next tick
+r becomes the old q next tick
+(like two real flip-flops in a pipeline)
+If you used = instead, you’d accidentally make r see the new q instantly, which is not how real flip-flops behave.
+
+
+terminology/acronyms:
+FSM = finite-state machine
+CSR = control and status register
+DMA = direct memory access

@@ -1,0 +1,18 @@
+tb/ (Testbench)
+This is not hardware. It’s a simulation driver that:
+generates a clock
+applies reset
+drives inputs (like start/op_code/memory responses)
+checks outputs
+Think: TB = the script that plays the role of “CPU + RAM + environment” around your design
+
+
+tb/tb_gpu_top.sv
+This is your current testbench. It does only three things:
+makes a clock
+toggles reset
+waits a bit and prints “SMOKE TEST DONE”
+It is not testing correctness yet. It’s just verifying:
+Verilator can compile everything
+the simulation runs
+Why this matters: early in hardware projects you want to know “my build flow works” before you spend hours writing logic.

@@ -1,0 +1,13 @@
+
+sim/Makefile
+This is what turns all of this into a runnable thing.
+Verilator reads your .sv files and generates C++
+then compiles that C++
+then runs it
+The important part is TOP=tb_gpu_top:
+Verilator needs a single “top module”
+in our case, the “top” is your testbench module, not the DUT (device under test)
+So:
+top module = tb_gpu_top
+inside TB, you instantiate gpu_top
+inside gpu_top, you instantiate fetch_engine + matrix_core
