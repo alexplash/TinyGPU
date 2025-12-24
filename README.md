@@ -1,6 +1,6 @@
 # TinyGPU — an efficient GPU system (Tiny matrix engine)
 
-![TinyGPU](TinyGPU.png)
+![TinyGPU](images/TinyGPU.png)
 
 TinyGPU is a small, streaming “GPU-like” compute block designed around a **matrix–vector multiply** data path. A host programs base addresses for weights and inputs, triggers a RUN, and the design fetches bytes from memory, streams them into a compute core, and streams back a vector of accumulated results.
 
